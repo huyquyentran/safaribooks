@@ -6,11 +6,12 @@ import sys
 import json
 import shutil
 import pathlib
-import getpass
 import logging
 import argparse
 import requests
 import traceback
+import tinycss2
+from tinycss2.ast import URLToken
 from html import escape
 from random import random
 from lxml import html, etree
@@ -572,8 +573,27 @@ class SafariBooks:
         return result + (self.get_book_chapters(page + 1) if response["next"] else [])
 
     def get_default_cover(self):
-        response = self.requests_provider(self.book_info["cover"], stream=True)
-        if response == 0:
+        # Try to get HD quality cover by modifying the URL
+        cover_url = self.book_info["cover"]
+
+        # Try different HD URL patterns
+        hd_cover = cover_url.rstrip("/") + "/900w/"
+        hd_url_attempts = [
+            hd_cover,
+            cover_url.replace("/thumb/", "/orig/"),  # Replace thumb with orig
+            cover_url.replace("/thumb/", "/"),  # Remove thumb directory
+            cover_url.replace("thumbnail", "cover"),  # Replace thumbnail with cover
+            cover_url  # Fallback to original
+        ]
+
+        response = None
+        for url in hd_url_attempts:
+            response = self.requests_provider(url, stream=True)
+            if response != 0 and response.status_code == 200:
+                self.display.log("Successfully retrieved HD cover from: %s" % url)
+                break
+
+        if response == 0 or response.status_code != 200:
             self.display.error("Error trying to retrieve the cover: %s" % self.book_info["cover"])
             return False
 
@@ -718,6 +738,13 @@ class SafariBooks:
                     svg_root.append(new_img)
 
         book_content = book_content[0]
+        # Hardcoded: Insert image for titlepage footer if present
+        titlepage_section = book_content.cssselect('section[data-type="titlepage"]')
+        if titlepage_section:
+            img = html.Element("img", src="titlepage_footer_ebook.png")
+            img.attrib["style"] = "margin:0 auto;max-width:80%;display:block;"
+            titlepage_section[0].addnext(img)
+        
         book_content.rewrite_links(self.link_replace)
 
         xhtml = None
@@ -866,12 +893,29 @@ class SafariBooks:
             if response == 0:
                 self.display.error("Error trying to retrieve this CSS: %s\n    From: %s" % (css_file, url))
 
-            with open(css_file, 'wb') as s:
-                s.write(response.content)
+            css_content = response.content.decode('utf-8')
+            srules = tinycss2.parse_stylesheet(css_content)
+            urlparts = urlparse(url)
+            baseurl = urlparts._replace(path=urlparts.path.rsplit('/',1)[0]).geturl()
 
+            filtered_rules = []
+            for rule in srules:
+                if rule.type == 'qualified-rule':
+                    skip = False
+                    for token in rule.content:
+                        if isinstance(token, URLToken):
+                            full_url = f"{baseurl}/{token.value}"
+                            self.images.append(full_url)
+                            skip = True
+                    if skip:
+                        continue
+                filtered_rules.append(rule)
+
+            with open(css_file, 'w') as s:
+                s.write(tinycss2.serialize(filtered_rules))
+                
         self.css_done_queue.put(1)
         self.display.state(len(self.css), self.css_done_queue.qsize())
-
 
     def _thread_download_images(self, url):
         image_name = url.split("/")[-1]
